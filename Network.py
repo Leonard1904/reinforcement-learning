@@ -3,167 +3,123 @@ import copy
 import tensorflow as tf
 import numpy as np
 
-from tensorflow import layers
+from tensorflow import layers, initializers
 from collections import Iterable
+
+
+def normalized_columns_initializer(std=1.0):
+    def _initializer(shape, dtype=None, partition_info=None):
+        out = np.random.randn(*shape).astype(np.float32)
+        out *= std / np.sqrt(np.square(out).sum(axis=0, keepdims=True))
+        return tf.constant(out)
+
+    return _initializer
 
 
 class Network:
 
-    def __init__(self, name, state_size, action_size, opt, feature_layers=None, critic_layers=None, actor_layers=None):
-        self.name = name
-        self.state_size = state_size
-        self.action_size = action_size
-        self.optimizer = opt
-        self.feature_layers = [
-            # layers.Dense(100, activation='relu', name="features"),
-            layers.Conv2D(filters=16, kernel_size=(8, 8), strides=(4, 4), activation=tf.nn.leaky_relu),
-            layers.Conv2D(filters=32, kernel_size=(4, 4), strides=(2, 2), activation=tf.nn.leaky_relu),
-            layers.Flatten(),
-            layers.Dense(256, activation=tf.nn.leaky_relu, name="features"),
-        ] if (feature_layers is None or not isinstance(feature_layers, Iterable)) else feature_layers
-        critic_layers = [
-            layers.Dense(1, name='value')
-        ] if (critic_layers is None or not isinstance(critic_layers, Iterable)) else critic_layers
-        actor_layers = [
-            layers.Dense(action_size, name='logits')
-        ] if (actor_layers is None or not isinstance(actor_layers, Iterable)) else actor_layers
+    def __init__(self, name, input_shape, output_dim, optimizer, logdir=None):
+        self.output_dim = output_dim
+        self.input_shape = input_shape
 
-        # with tf.device("/cpu:{}".format(idx)):
-        self.state = tf.placeholder(tf.float32, shape=[None, *state_size], name="states")
-        with tf.variable_scope(self.name):
-            self.feature = self._layers_output(self.feature_layers, self.state)
-            # self.feature_ = self._layers_output(self.feature_layers, self.state)
-            self.value = self._layers_output(critic_layers, self.feature)
-            self.logits = self._layers_output(actor_layers, self.feature)
-            self.policy = tf.nn.softmax(self.logits, name='policy')
+        with tf.variable_scope(name):
+            self.states = tf.placeholder(tf.float32, shape=[None, *input_shape], name="states")
+            net = self.states
+            for i in range(4):
+                net = tf.layers.Conv2D(filters=32,
+                                       kernel_size=(3, 3),
+                                       strides=2,
+                                       activation='elu',
+                                       kernel_initializer=initializers.he_uniform(),
+                                       bias_initializer=initializers.constant(0.0),
+                                       name="conv{}_{}".format(i, name)
+                                       )(net)
+            net = tf.layers.Flatten()(net)
 
-        if name != 'global':
-            self.value_loss, self.policy_loss, self.entropy_loss, self.total_loss = self._compute_loss()
+            net = tf.layers.Dense(256, activation='elu',
+                                  kernel_initializer=initializers.random_normal,
+                                  bias_initializer=initializers.constant(0.0),
+                                  name='dense_{}'.format(name)
+                                  )(net)
+
+            # Recurrent network for temporal dependencies
+            lstm_cell = tf.contrib.rnn.BasicLSTMCell(256, state_is_tuple=True)
+            c_init = np.zeros((1, lstm_cell.state_size.c), np.float32)
+            h_init = np.zeros((1, lstm_cell.state_size.h), np.float32)
+            self.cell_init = [c_init, h_init]
+
+            c_in = tf.placeholder(tf.float32, [1, lstm_cell.state_size.c])
+            h_in = tf.placeholder(tf.float32, [1, lstm_cell.state_size.h])
+            self.cell_in = (c_in, h_in)
+            rnn_in = tf.expand_dims(net, [0])
+            step_size = tf.shape([-1, *input_shape])[:1]
+            state_in = tf.contrib.rnn.LSTMStateTuple(c_in, h_in)
+            lstm_outputs, lstm_state = tf.nn.dynamic_rnn(
+                lstm_cell, rnn_in, initial_state=state_in, sequence_length=step_size,
+                time_major=False)
+            lstm_c, lstm_h = lstm_state
+            self.cell_out = (lstm_c[:1, :], lstm_h[:1, :])
+            # net = tf.reshape(lstm_outputs, [-1, 256])
+
+            # actor network
+            logits = tf.layers.Dense(output_dim, kernel_initializer=normalized_columns_initializer(0.01),
+                                     name="final_fc_{}".format(name))(net)
+            self.action_prob = tf.nn.softmax(logits, name="action_prob")
+            # value network
+            self.values = tf.squeeze(tf.layers.Dense(1, kernel_initializer=normalized_columns_initializer(1),
+                                                     name="values_{}".format(name))(net))
+
+            # actor loss
+            self.actions = tf.placeholder(tf.uint8, shape=[None], name="actions")
+            self.rewards = tf.placeholder(tf.float32, shape=[None], name="rewards")
+            self.advantage = tf.placeholder(tf.float32, shape=[None], name="advantage")
+
+            entropy = -0.01 * tf.reduce_sum(self.action_prob * tf.nn.log_softmax(logits))
+
+            action_onehot = tf.one_hot(self.actions, self.output_dim, name="action_onehot")
+            # single_action_prob = tf.reduce_sum(tf.nn.log_softmax(logits) * action_onehot, axis=1)
+            # log_action_prob = tf.log(single_action_prob + 1e-7)
+            # maximize_objective = log_action_prob * self.advantage
+            # self.actor_loss = - tf.reduce_sum(maximize_objective)
+            # self.actor_loss = - tf.reduce_sum(
+            #     tf.reduce_sum(tf.nn.log_softmax(logits) * action_onehot, [1]) * self.advantage)
+            self.actor_loss = tf.nn.softmax_cross_entropy_with_logits_v2(labels=action_onehot,
+                                                                         logits=logits)
+            self.actor_loss *= tf.stop_gradient(self.advantage)
+
+            # value loss
+            self.value_loss = .5 * tf.reduce_sum(tf.square(self.values - self.rewards))
+
+            self.total_loss = self.actor_loss - entropy + self.value_loss
+            self.train_op = optimizer.minimize(self.total_loss)
+
             self.gradients = tf.gradients(self.total_loss,
-                                          tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=self.name))
-            grads, self.grad_norms = tf.clip_by_global_norm(self.gradients, 40.0)
-            self.apply_grads = opt.apply_gradients(
-                zip(grads, tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, 'global')))
-        else:
-            # self.writer = tf.summary.FileWriter('./graphs', sess.graph)
+                                          tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=name))
+            self.grads, self.grad_norms = tf.clip_by_global_norm(self.gradients, 40.0)
+            # opt = tf.train.AdamOptimizer(1e-4)
+            self.apply_gradients = optimizer.apply_gradients(
+                zip(self.grads, tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, 'global')))
 
-            self.reward_summary_ph = tf.placeholder(tf.float32, name="reward_summary")
-            self.reward_summary = tf.summary.scalar(name='reward_summary', tensor=self.reward_summary_ph)
+            self.sync = tf.group(*[v1.assign(v2) for v1, v2 in
+                                   zip(tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, name),
+                                       tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, 'global'))])
 
-            self.merged_summary_op = tf.summary.merge_all()
-            self.writer = tf.summary.FileWriter('./graphs', tf.get_default_graph())
+        if logdir:
+            loss_summary = tf.summary.scalar("total_loss", self.total_loss)
+            value_summary = tf.summary.histogram("values", self.values)
 
-        # self.test = tf.get_default_graph().get_tensor_by_name(os.path.split(self.value.name)[0] + '/kernel:0')
+            self.summary_op = tf.summary.merge([loss_summary, value_summary])
+            self.summary_writer = tf.summary.FileWriter(logdir)
 
-    def summary(self, sess, reward, step):
-        summary = sess.run(
-            self.merged_summary_op,
-            feed_dict={self.reward_summary_ph: reward}
-        )
-        self.writer.add_summary(summary, step)
+    def choose_action(self, sess, state, rnn_state):
+        feed = {
+            # self.states: [np.transpose(state, (1, 2, 0))],
+            self.states: [state],
+            self.cell_in[0]: rnn_state[0],
+            self.cell_in[1]: rnn_state[1],
+        }
 
-    @staticmethod
-    def _layers_output(layers, x):
-        # use deep copy to initialize new objects
-        for l in copy.deepcopy(layers):
-            x = l.apply(x)
-        return x
+        action, value, rnn_state_ = sess.run([self.action_prob, self.values, self.cell_out], feed)
+        action = np.squeeze(action)
 
-    def _compute_loss(self):
-        self.selected_action = tf.placeholder(tf.int32, [None], name="labels")
-        actions_onehot = tf.one_hot(self.selected_action, self.action_size, dtype=tf.float32)
-        self.discounted_reward = tf.placeholder(tf.float32, [None])
-        self.advantages = tf.placeholder(tf.float32, [None])
-
-        responsible_outputs = tf.reduce_sum(self.policy * actions_onehot, [1])
-        value_loss = 0.5 * tf.reduce_sum(tf.square(self.discounted_reward - tf.reshape(self.value, [-1])))
-
-        entropy = - tf.reduce_sum(self.policy * tf.log(self.policy + 10e-13))
-        # entropy = tf.nn.softmax_cross_entropy_with_logits_v2(labels=self.policy, logits=self.logits)
-        policy_loss = -tf.reduce_sum(tf.log(responsible_outputs + 10e-13) * self.advantages)
-
-        total_loss = 0.5 * value_loss + policy_loss - entropy * 0.05
-
-        return value_loss, policy_loss, entropy, total_loss
-
-    def get_value(self, state, sess):
-        return sess.run(self.value, feed_dict={self.state: np.reshape(state, [-1, *self.state_size])})[0][0]
-
-    def get_values(self, state, sess):
-        return sess.run(self.value, feed_dict={self.state: np.reshape(state, [-1, *self.state_size])})
-
-    def get_action(self, state, sess):
-        policy = sess.run(self.policy, feed_dict={self.state: np.reshape(state, [-1, *self.state_size])})
-        return np.random.choice(range(self.action_size), p=policy[0])
-
-    @staticmethod
-    def transfer_weights(from_scope, to_scope):
-        from_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, from_scope)
-        to_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, to_scope)
-
-        op_holder = []
-        for from_var, to_var in zip(from_vars, to_vars):
-            op_holder.append(to_var.assign(from_var))
-        return op_holder
-
-
-if __name__ == '__main__':
-    '''
-        Example for initializing a network
-    '''
-    import gym
-    from scipy.signal import lfilter
-    from scipy.misc import imresize
-
-
-    def _preprocess(image, height_range=(35, 193), bg=(144, 72, 17)):
-        image = image[height_range[0]:height_range[1], ...]
-        image = imresize(image, (80, 80), interp="nearest")
-
-        H, W, _ = image.shape
-
-        R = image[..., 0]
-        G = image[..., 1]
-        B = image[..., 2]
-
-        cond = (R == bg[0]) & (G == bg[1]) & (B == bg[2])
-
-        image = np.zeros((H, W))
-        image[~cond] = 1
-
-        image = np.expand_dims(image, axis=2)
-
-        return image
-
-
-    def discount(arr):
-        return lfilter([1], [1, -0.99], x=arr[::-1])[::-1]
-
-
-    tf.reset_default_graph()
-
-    env = gym.make('Pong-v0')
-
-    opt = tf.train.AdamOptimizer(use_locking=True)
-    network = Network('global', (80, 80, 1), 3, opt)
-    with tf.Session() as sess:
-        sess.run(tf.global_variables_initializer())
-        sess.run(tf.local_variables_initializer())
-
-        a = network.get_action(_preprocess(env.reset()), sess)
-        value = network.get_value(_preprocess(env.reset()), sess)
-        print(a)
-        print(value)
-
-        arr = np.array([0, 0, 0, 0])
-        print(discount(arr))
-
-        arr = np.array([0, 0, 0, 0])
-        print(arr)
-        print(arr.tolist() + [1])
-        print(discount(arr.tolist() + [1])[:-1])
-
-        # print(np.squeeze(sess.run(local.test))[-20:])
-        # print('-----')
-        # input()
-        # test training
+        return np.random.choice(np.arange(self.output_dim), p=action), value, rnn_state_
